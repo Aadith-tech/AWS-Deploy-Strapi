@@ -1,0 +1,258 @@
+#!/bin/bash
+set -e  # Exit on any error
+
+# Redirect output to log file
+exec > >(tee -a /var/log/user-data.log)
+exec 2>&1
+
+echo "============================================"
+echo "Starting Strapi installation at $(date)"
+echo "============================================"
+
+# Update system
+echo "[1/10] Updating system packages..."
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
+sudo apt update -y
+sudo apt upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+
+# Install dependencies
+echo "[2/10] Installing build dependencies..."
+sudo apt install -y curl build-essential libssl-dev mysql-client
+
+# Install Node.js 20 LTS
+echo "[3/10] Installing Node.js 20 LTS..."
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo DEBIAN_FRONTEND=noninteractive apt install -y nodejs
+
+# Ensure npm is in PATH
+export PATH="/usr/bin:$PATH"
+
+# Verify Node.js installation
+echo "Node version: $(node --version)"
+echo "NPM version: $(npm --version)"
+
+# Verify npm is accessible
+which npm || { echo "ERROR: npm not found in PATH"; exit 1; }
+
+# Wait for RDS database to be ready
+echo "[4/10] Waiting for RDS database to be available..."
+MAX_RETRIES=60
+RETRY_COUNT=0
+DB_READY=false
+
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+  RETRY_COUNT=$((RETRY_COUNT + 1))
+  echo "Attempt $RETRY_COUNT/$MAX_RETRIES: Checking database at ${db_host}:${db_port}..."
+
+  if mysql -h ${db_host} -P ${db_port} -u ${db_username} -p'${db_password}' -e "SELECT 1;" 2>/dev/null; then
+    echo "✅ Database is ready and accepting connections!"
+    DB_READY=true
+    break
+  else
+    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+      echo "⏳ Database not ready yet, waiting 30 seconds..."
+      sleep 30
+    fi
+  fi
+done
+
+if [ "$DB_READY" = false ]; then
+  echo "❌ ERROR: Database failed to become available after 30 minutes"
+  echo "Please check:"
+  echo "  - RDS security group allows EC2 security group"
+  echo "  - RDS is in 'available' state"
+  echo "  - Network connectivity is correct"
+  exit 1
+fi
+
+# Create Strapi project as ubuntu user
+cd /home/ubuntu
+
+echo "[5/10] Creating Strapi application (this takes 3-5 minutes)..."
+
+# Create script to run as ubuntu user
+cat > /tmp/create-strapi.sh << 'SCRIPT_END'
+#!/bin/bash
+set -e
+cd /home/ubuntu
+
+# Set environment variables to disable prompts
+export STRAPI_DISABLE_UPDATE_NOTIFICATION=true
+export STRAPI_TELEMETRY_DISABLED=true
+export STRAPI_DISABLE_REMOTE_DATA_TRANSFER=true
+export NODE_ENV=development
+
+# Create Strapi app - pipe "N" to answer A/B testing prompt
+echo "N" | npx create-strapi-app@latest strapiCMS \
+  --quickstart \
+  --no-run \
+  --skip-cloud
+
+echo "Strapi app created successfully"
+SCRIPT_END
+
+chmod +x /tmp/create-strapi.sh
+sudo -u ubuntu /tmp/create-strapi.sh
+
+# Install dependencies
+cd /home/ubuntu/strapiCMS
+echo "[6/10] Installing MySQL and S3 dependencies..."
+sudo -u ubuntu npm install mysql2 @strapi/provider-upload-aws-s3
+
+# Create database configuration
+echo "[7/10] Configuring database connection..."
+sudo -u ubuntu tee config/database.js > /dev/null << 'EOF'
+module.exports = ({ env }) => ({
+  connection: {
+    client: 'mysql2',
+    connection: {
+      host: env('DATABASE_HOST'),
+      port: env.int('DATABASE_PORT', 3306),
+      database: env('DATABASE_NAME'),
+      user: env('DATABASE_USERNAME'),
+      password: env('DATABASE_PASSWORD'),
+      ssl: env.bool('DATABASE_SSL', false),
+    },
+    useNullAsDefault: true,
+  },
+});
+EOF
+
+# Create S3 plugin configuration (overwrite the default empty plugins.ts)
+echo "[7/10] Configuring S3 plugin..."
+sudo -u ubuntu tee config/plugins.ts > /dev/null << 'EOF'
+export default ({ env }) => ({
+  upload: {
+    config: {
+      provider: 'aws-s3',
+      providerOptions: {
+        baseUrl: env('CDN_URL'),
+        rootPath: env('CDN_ROOT_PATH'),
+        s3Options: {
+          credentials: {
+            accessKeyId: env('AWS_ACCESS_KEY_ID'),
+            secretAccessKey: env('AWS_ACCESS_SECRET'),
+          },
+          region: env('AWS_REGION'),
+        },
+        params: {
+          ACL: env('AWS_ACL', 'public-read'),
+          signedUrlExpires: env.int('AWS_SIGNED_URL_EXPIRES', 15 * 60),
+          Bucket: env('AWS_BUCKET'),
+        },
+      },
+      actionOptions: {
+        upload: {},
+        uploadStream: {},
+        delete: {},
+      },
+    },
+  },
+});
+EOF
+
+# Create .env file with all required variables
+echo "[8/10] Creating environment configuration..."
+sudo -u ubuntu tee .env > /dev/null << EOF
+HOST=0.0.0.0
+PORT=1337
+APP_KEYS=$(openssl rand -base64 32),$(openssl rand -base64 32)
+API_TOKEN_SALT=$(openssl rand -base64 32)
+ADMIN_JWT_SECRET=$(openssl rand -base64 32)
+TRANSFER_TOKEN_SALT=$(openssl rand -base64 32)
+JWT_SECRET=$(openssl rand -base64 32)
+
+DATABASE_CLIENT=mysql
+DATABASE_HOST=${db_host}
+DATABASE_PORT=${db_port}
+DATABASE_NAME=${db_name}
+DATABASE_USERNAME=${db_username}
+DATABASE_PASSWORD=${db_password}
+DATABASE_SSL=false
+
+AWS_REGION=${aws_region}
+AWS_BUCKET=${s3_bucket}
+AWS_ACCESS_KEY_ID=${aws_access_key_id}
+AWS_ACCESS_SECRET=${aws_secret_access_key}
+
+NODE_ENV=development
+STRAPI_DISABLE_UPDATE_NOTIFICATION=true
+STRAPI_TELEMETRY_DISABLED=true
+STRAPI_DISABLE_REMOTE_DATA_TRANSFER=true
+EOF
+
+# Build admin panel
+echo "[9/10] Building Strapi admin panel (this takes 5-7 minutes)..."
+sudo -u ubuntu npm run build
+
+# Install PM2 globally
+echo "[10/10] Installing PM2 and starting Strapi..."
+sudo npm install -g pm2
+
+# Start Strapi with PM2
+cd /home/ubuntu/strapiCMS
+sudo -u ubuntu pm2 start npm --name "strapi" -- start
+sudo -u ubuntu pm2 save
+
+# Configure PM2 to start on boot
+#sudo env PATH=$PATH:/usr/bin /usr/local/lib/node_modules/pm2/bin/pm2 startup systemd -u ubuntu --hp /home/ubuntu
+#sudo -u ubuntu pm2 save
+
+# Wait for Strapi to initialize
+sleep 20
+
+# Get public IP
+PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+
+echo "============================================"
+echo "✅ Strapi installation completed at $(date)"
+echo "============================================"
+echo ""
+echo "🚀 Strapi is running on http://$PUBLIC_IP:1337"
+echo ""
+echo "📊 Monitor installation:"
+echo "   View logs:    tail -f /var/log/user-data.log"
+echo "   PM2 status:   sudo -u ubuntu pm2 status"
+echo "   PM2 logs:     sudo -u ubuntu pm2 logs strapi"
+echo ""
+echo "🔧 Troubleshooting:"
+echo "   Check database: mysql -h ${db_host} -u ${db_username} -p'${db_password}' -e 'SHOW DATABASES;'"
+echo "   Test Strapi:    curl http://localhost:1337"
+echo ""
+echo "============================================"
+
+# Signal completion by creating a marker file
+touch /var/log/user-data-completed
+echo "Installation marker created at $(date)" >> /var/log/user-data-completed
+
+
+
+output "installation_instructions" {
+  description = "How to monitor the installation"
+  value = <<-EOT
+
+  ========================================
+  STRAPI DEPLOYMENT IN PROGRESS
+  ========================================
+
+  EC2 Instance: ${aws_instance.StrapiVM.public_ip}
+
+  Installation takes 15-25 minutes. Monitor progress:
+
+  1. Watch real-time logs:
+     ssh -i ${var.private_key_config.private_key_path} ubuntu@${aws_instance.StrapiVM.public_ip} 'tail -f /var/log/user-data.log'
+
+  2. Check if completed:
+     ssh -i ${var.private_key_config.private_key_path} ubuntu@${aws_instance.StrapiVM.public_ip} 'cat /var/log/user-data-completed'
+
+  3. Check Strapi status:
+     ssh -i ${var.private_key_config.private_key_path} ubuntu@${aws_instance.StrapiVM.public_ip} 'pm2 status'
+
+  4. Access Strapi:
+     http://${aws_instance.StrapiVM.public_ip}:1337
+
+  ========================================
+  EOT
+}
