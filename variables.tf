@@ -69,7 +69,7 @@ variable "private_subnet1" {
     type = map(string)
     default = {
       cidr_block = "10.0.2.0/24"
-        availability_zone = "ap-south-1b"
+        availability_zone = "ap-south-1a"
 
       }
 }
